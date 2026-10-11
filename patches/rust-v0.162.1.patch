@@ -1,0 +1,189 @@
+diff --git a/codex-rs/tui/src/bottom_pane/chat_composer.rs b/codex-rs/tui/src/bottom_pane/chat_composer.rs
+index c919e31..e1e0c71 100644
+--- a/codex-rs/tui/src/bottom_pane/chat_composer.rs
++++ b/codex-rs/tui/src/bottom_pane/chat_composer.rs
+@@ -47,6 +47,8 @@
+ //! Warning and transcript views hide suggestions without losing the draft, query, or selection.
+ //! Measurement, painting, and cursor placement share that layout, including clipped views.
+ //! Unified mention tabs retain their position across filters; Left/Right also works at a bare `@`.
++//! A next-prompt suggestion from the last completed answer renders as dim composer text and Tab
++//! accepts it when no popup owns the key.
+ //!
+ //! Popup targeting resolves an editable token range around the cursor and treats atomic text
+ //! elements as hard boundaries. When that range begins immediately after an atomic element, the
+@@ -612,6 +614,7 @@ pub(crate) struct ChatComposer {
+     luna_reserve_active: bool,
+     attachments: AttachmentState,
+     placeholder_text: String,
++    next_prompt_suggestion: Option<String>,
+     blocks_direct_input: bool,
+     is_task_running: bool,
+     queue_submissions: bool,
+@@ -788,6 +791,7 @@ impl ChatComposer {
+             luna_reserve_active: false,
+             attachments: AttachmentState::default(),
+             placeholder_text,
++            next_prompt_suggestion: None,
+             blocks_direct_input: false,
+             is_task_running: false,
+             queue_submissions: false,
+@@ -1483,6 +1487,10 @@ impl ChatComposer {
+         self.attachments.remote_image_urls()
+     }
+ 
++    pub(crate) fn set_next_prompt_suggestion(&mut self, suggestion: Option<String>) {
++        self.next_prompt_suggestion = suggestion.filter(|text| !text.trim().is_empty());
++    }
++
+     pub(crate) fn take_remote_image_urls(&mut self) -> Vec<String> {
+         let urls = self
+             .attachments
+@@ -1959,6 +1967,20 @@ impl ChatComposer {
+             return (InputResult::None, true);
+         }
+ 
++        if !self.popups.active()
++            && self.history_search.is_none()
++            && self.draft.textarea.is_empty()
++            && key_event.code == KeyCode::Tab
++            && key_event.modifiers.is_empty()
++            && let Some(suggestion) = self.next_prompt_suggestion.take()
++        {
++            self.draft.textarea.set_text_clearing_elements(&suggestion);
++            self.draft.textarea.set_cursor(suggestion.len());
++            self.draft.textarea.enter_vim_insert_mode();
++            self.draft.textarea_state.get_mut().follow_cursor();
++            return (InputResult::None, true);
++        }
++
+         let result = match &mut self.popups.active {
+             ActivePopup::Command(_) => self.handle_key_event_with_slash_popup(key_event),
+             ActivePopup::File(_) => self.handle_key_event_with_file_popup(key_event),
+@@ -3095,6 +3117,16 @@ impl ChatComposer {
+         let result =
+             self.handle_submission_with_time(should_queue, tokio::time::Instant::now().into_std());
+         self.reset_vim_mode_after_successful_dispatch(&result.0);
++        if matches!(
++            &result.0,
++            InputResult::Submitted { .. }
++                | InputResult::Queued { .. }
++                | InputResult::Command(_)
++                | InputResult::ServiceTierCommand(_)
++                | InputResult::CommandWithArgs(_, _, _)
++        ) {
++            self.next_prompt_suggestion = None;
++        }
+         result
+     }
+ 
+@@ -4887,7 +4919,20 @@ impl ChatComposer {
+             }
+         }
+         if !self.draft.input_enabled || textarea_is_empty {
+-            let text = if self.draft.input_enabled {
++            let suggestion_preview = (self.draft.input_enabled
++                && textarea_is_empty
++                && !self.is_task_running
++                && !self.popups.active()
++                && self.history_search.is_none())
++            .then(|| self.next_prompt_suggestion.as_deref())
++            .flatten();
++            let text = if let Some(suggestion) = suggestion_preview {
++                let first_line = suggestion
++                    .lines()
++                    .find(|line| !line.trim().is_empty())
++                    .unwrap_or_default();
++                format!("{first_line}   [Tab 插入完整 prompt]")
++            } else if self.draft.input_enabled {
+                 self.placeholder_text.as_str().to_string()
+             } else {
+                 self.draft
+diff --git a/codex-rs/tui/src/bottom_pane/mod.rs b/codex-rs/tui/src/bottom_pane/mod.rs
+index c0e3902..93f9ed7 100644
+--- a/codex-rs/tui/src/bottom_pane/mod.rs
++++ b/codex-rs/tui/src/bottom_pane/mod.rs
+@@ -1407,6 +1407,11 @@ impl BottomPane {
+         self.request_redraw();
+     }
+ 
++    pub(crate) fn set_next_prompt_suggestion(&mut self, suggestion: Option<String>) {
++        self.composer.set_next_prompt_suggestion(suggestion);
++        self.request_redraw();
++    }
++
+     /// Show a generic list selection view with the provided items.
+     pub(crate) fn show_selection_view(
+         &mut self,
+diff --git a/codex-rs/tui/src/chatwidget/protocol.rs b/codex-rs/tui/src/chatwidget/protocol.rs
+index 85ea551..e2d8193 100644
+--- a/codex-rs/tui/src/chatwidget/protocol.rs
++++ b/codex-rs/tui/src/chatwidget/protocol.rs
+@@ -472,6 +472,14 @@ impl ChatWidget {
+                     question_drafts = self.take_question_drafts();
+                 }
+                 self.last_non_retry_error = None;
++                if replay_kind.is_none() {
++                    let final_answer = last_agent_message
++                        .as_ref()
++                        .map(|(_, _, text)| text.as_str());
++                    self.bottom_pane.set_next_prompt_suggestion(
++                        final_answer.and_then(extract_next_prompt_suggestion),
++                    );
++                }
+                 let completion = self.completion_cell(&notification.turn, replay_kind);
+                 self.on_task_complete(
+                     last_agent_message.map(|(_, _, text)| text),
+@@ -480,6 +488,9 @@ impl ChatWidget {
+                 );
+             }
+             TurnStatus::Interrupted => {
++                if replay_kind.is_none() {
++                    self.bottom_pane.set_next_prompt_suggestion(None);
++                }
+                 if replay_kind.is_none() {
+                     question_drafts = self.take_question_drafts();
+                 }
+@@ -495,6 +506,9 @@ impl ChatWidget {
+                 self.on_interrupted_turn(reason);
+             }
+             TurnStatus::Failed => {
++                if replay_kind.is_none() {
++                    self.bottom_pane.set_next_prompt_suggestion(None);
++                }
+                 if replay_kind.is_none() {
+                     question_drafts = self.take_question_drafts();
+                 }
+@@ -677,3 +691,33 @@ impl ChatWidget {
+         }
+     }
+ }
++
++fn extract_next_prompt_suggestion(answer: &str) -> Option<String> {
++    let lines: Vec<&str> = answer.lines().collect();
++    let mut found_heading = false;
++    for (index, line) in lines.iter().enumerate() {
++        let lower = line.to_lowercase();
++        if lower.contains("next prompt")
++            || ((line.contains("下一步") || line.contains("下一个")) && lower.contains("prompt"))
++        {
++            found_heading = true;
++            continue;
++        }
++        if !found_heading || !line.trim_start().starts_with("```") {
++            continue;
++        }
++        let mut candidate = Vec::new();
++        for content_line in lines.iter().skip(index + 1) {
++            if content_line.trim_start().starts_with("```") {
++                break;
++            }
++            candidate.push(*content_line);
++        }
++        let candidate = candidate.join("\n").trim().to_string();
++        if !candidate.is_empty() {
++            return Some(candidate);
++        }
++        found_heading = false;
++    }
++    None
++}

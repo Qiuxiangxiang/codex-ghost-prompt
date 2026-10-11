@@ -1,0 +1,12 @@
+#!/bin/sh
+set -eu
+ROOT=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+TAG=rust-v0.162.1
+BUILD_ROOT=${CODEX_GHOST_BUILD_DIR:-${TMPDIR:-/tmp}/codex-ghost-prompt-$TAG}
+BIN="$BUILD_ROOT/codex/codex-rs/target/release/codex"
+
+if [ ! -x "$BIN" ]; then
+  "$ROOT/build.sh"
+fi
+
+exec "$BIN" "$@"
